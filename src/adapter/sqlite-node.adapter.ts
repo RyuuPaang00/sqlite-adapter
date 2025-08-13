@@ -6,7 +6,10 @@ import _sqlite3, { Database } from "sqlite3";
 const isDev = process.env.NODE_ENV !== "production";
 
 const sqlite3 = isDev ? _sqlite3.verbose() : _sqlite3;
-
+export type SQLList = {
+  sql: string;
+  params?: any[];
+}[];
 class SqliteNodePrepare implements ISqlitePrepare {
   public sql: string;
   private stmt: _sqlite3.Statement;
@@ -87,6 +90,42 @@ export class SqliteNodeAdapter implements IAdapter {
     });
   };
 
+  transaction = async (sqlList: SQLList) => {
+    if (!this.db) throw new Error("Not connected to a database.");
+
+    return new Promise<any[]>((res, rej) => {
+      const result: any[] = [];
+      let resultCount = 0;
+      this.db!.serialize(() => {
+        try {
+          this.db!.exec("BEGIN TRANSACTION");
+          sqlList.forEach(({ sql, params }) => {
+            this.db!.all(sql, params, (err, rows) => {
+              if (err) {
+                throw new Error(
+                  `SQL Error: ${
+                    err.message
+                  }, SQL: ${sql}, Params: ${JSON.stringify(params)}`
+                );
+              }
+              result.push(rows);
+              resultCount += 1;
+              if (resultCount === sqlList.length) {
+                res(result);
+              }
+            });
+          });
+          this.db!.exec("COMMIT");
+          // res(result);
+        } catch (error) {
+          this.db!.exec("ROLLBACK", () => {
+            rej(error);
+          });
+        }
+      });
+    });
+  };
+
   private exec: <T>(sql: string, params?: any[]) => Promise<T> = async (
     sql: string,
     params?: any[]
@@ -121,15 +160,36 @@ export class SqliteNodeAdapter implements IAdapter {
     const sqlArr = sql.split(";");
     let idx = 0;
     let result: any[] = [];
-    for (const item of sqlArr) {
-      if (item.trim()) {
-        const count = item.replace(/[^\?]/g, "").length;
-        const res = await this.exec<T>(item, params?.slice(idx, idx + count));
-        idx += count;
-        result = result.concat(res);
-      }
-    }
-    return result as T;
+    let cbCount = 0;
+    return new Promise<T>((resolve, reject) => {
+      this.db!.serialize(async () => {
+        for (const item of sqlArr) {
+          if (item.trim()) {
+            const count = item.replace(/[^\?]/g, "").length;
+            this.exec<T>(item, params?.slice(idx, idx + count))
+              .then((res) => {
+                result = result.concat(res);
+                cbCount += 1;
+                if (cbCount === sqlArr.length) {
+                  resolve(result as any);
+                }
+              })
+              .catch((err) => {
+                reject(err);
+              });
+            idx += count;
+            // result = result.concat(res);
+          } else {
+            cbCount += 1;
+            if (cbCount === sqlArr.length) {
+              resolve(result as any);
+            }
+          }
+        }
+        // res(result);
+      });
+    });
+    // return result as T;
   };
   prepare: (sql: string) => Promise<ISqlitePrepare> = async (sql: string) => {
     if (!this.db) throw new Error("Not connected to a database.");
